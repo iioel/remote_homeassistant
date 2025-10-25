@@ -1,5 +1,6 @@
 """Simple implementation to call Home Assistant REST API."""
 
+import asyncio
 from homeassistant import exceptions
 from homeassistant.helpers.aiohttp_client import async_get_clientsession
 
@@ -44,16 +45,19 @@ async def async_get_discovery_info(hass, host, port, secure, access_token, verif
     session = async_get_clientsession(hass, verify_ssl)
 
     # Fetch discovery info location for name and unique UUID
-    async with session.get(url, headers=headers) as resp:
-        if resp.status == 404:
-            raise EndpointMissing()
-        if 400 <= resp.status < 500:
-            raise InvalidAuth()
-        if resp.status != 200:
-            raise ApiProblem()
-        json = await resp.json()
-        if not isinstance(json, dict):
-            raise BadResponse(f"Bad response data: {json}")
-        if "uuid" not in json:
-            raise UnsupportedVersion()
-        return json
+    try:
+        async with session.get(url, headers=headers, timeout=30) as resp:
+            if resp.status == 404:
+                raise EndpointMissing()
+            if 400 <= resp.status < 500:
+                raise InvalidAuth()
+            if resp.status != 200:
+                raise ApiProblem()
+            json = await resp.json()
+            if not isinstance(json, dict):
+                raise BadResponse(f"Bad response data: {json}")
+            if "uuid" not in json:
+                raise UnsupportedVersion()
+            return json
+    except asyncio.TimeoutError as err:
+        raise CannotConnect(f"Timeout connecting to {host}:{port}") from err

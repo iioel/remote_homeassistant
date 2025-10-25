@@ -76,6 +76,9 @@ STATE_DISCONNECTED = "disconnected"
 DEFAULT_ENTITY_PREFIX = ""
 DEFAULT_ENTITY_FRIENDLY_NAME_PREFIX = ""
 
+# Connection timeout for initial connection and discovery
+CONNECTION_TIMEOUT = 30
+
 INSTANCES_SCHEMA = vol.Schema(
     {
         vol.Required(CONF_HOST): cv.string,
@@ -188,8 +191,8 @@ async def _async_update_config_entry_if_from_yaml(hass, entries_by_id, conf):
             conf[CONF_ACCESS_TOKEN],
             conf[CONF_VERIFY_SSL],
         )
-    except Exception:
-        _LOGGER.exception(f"reload of {conf[CONF_HOST]} failed")
+    except Exception as err:
+        _LOGGER.warning("Reload of %s failed: %s", conf[CONF_HOST], err)
     else:
         entry = entries_by_id.get(info["uuid"])
         if entry:
@@ -410,20 +413,39 @@ class RemoteConnection:
         async def _async_instance_get_info():
             """Fetch discovery info from remote instance."""
             try:
-                return await async_get_discovery_info(
-                    self._hass,
+                return await asyncio.wait_for(
+                    async_get_discovery_info(
+                        self._hass,
+                        self._entry.data[CONF_HOST],
+                        self._entry.data[CONF_PORT],
+                        self._secure,
+                        self._access_token,
+                        self._verify_ssl,
+                    ),
+                    timeout=CONNECTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timeout connecting to %s:%s",
+                    self._entry.data[CONF_HOST],
+                    self._entry.data[CONF_PORT]
+                )
+            except (OSError, ConnectionError, aiohttp.ClientError) as err:
+                _LOGGER.info(
+                    "Unable to connect to %s:%s - %s",
                     self._entry.data[CONF_HOST],
                     self._entry.data[CONF_PORT],
-                    self._secure,
-                    self._access_token,
-                    self._verify_ssl,
+                    err
                 )
-            except OSError:
-                _LOGGER.exception("failed to connect")
             except UnsupportedVersion:
                 _LOGGER.error("Unsupported version, at least 0.111 is required.")
-            except Exception:
-                _LOGGER.exception("failed to fetch instance info")
+            except Exception as err:
+                _LOGGER.warning(
+                    "Failed to fetch instance info from %s:%s - %s",
+                    self._entry.data[CONF_HOST],
+                    self._entry.data[CONF_PORT],
+                    err
+                )
             return None
 
         @callback
@@ -446,6 +468,9 @@ class RemoteConnection:
         self.set_connection_state(STATE_CONNECTING)
 
         while True:
+            if self._is_stopping:
+                return
+
             info = await _async_instance_get_info()
 
             # Verify we are talking to correct instance
@@ -456,9 +481,31 @@ class RemoteConnection:
 
             try:
                 _LOGGER.info("Connecting to %s", url)
-                self._connection = await session.ws_connect(url, max_msg_size = self._max_msg_size)
-            except aiohttp.client_exceptions.ClientError:
-                _LOGGER.error("Could not connect to %s, retry in 10 seconds...", url)
+                self._connection = await asyncio.wait_for(
+                    session.ws_connect(url, max_msg_size=self._max_msg_size),
+                    timeout=CONNECTION_TIMEOUT
+                )
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "Timeout while connecting to %s, retry in 10 seconds...",
+                    url
+                )
+                self.set_connection_state(STATE_RECONNECTING)
+                await asyncio.sleep(10)
+            except (aiohttp.ClientError, OSError, ConnectionError) as err:
+                _LOGGER.info(
+                    "Could not connect to %s: %s, retry in 10 seconds...",
+                    url,
+                    err
+                )
+                self.set_connection_state(STATE_RECONNECTING)
+                await asyncio.sleep(10)
+            except Exception as err:
+                _LOGGER.warning(
+                    "Unexpected error connecting to %s: %s, retry in 10 seconds...",
+                    url,
+                    err
+                )
                 self.set_connection_state(STATE_RECONNECTING)
                 await asyncio.sleep(10)
             else:
@@ -492,22 +539,30 @@ class RemoteConnection:
                 _LOGGER.debug("Got pong: %s", message)
                 event.set()
 
-            await self.call(resp, "ping")
+            try:
+                await self.call(resp, "ping")
+            except Exception as err:
+                _LOGGER.debug("Error sending heartbeat: %s", err)
+                break
 
             try:
                 await asyncio.wait_for(event.wait(), HEARTBEAT_TIMEOUT)
             except asyncio.TimeoutError:
-                _LOGGER.warning("heartbeat failed")
+                _LOGGER.info("Heartbeat timeout, connection may be lost")
 
                 # Schedule closing on event loop to avoid deadlock
-                asyncio.ensure_future(self._connection.close())
+                if self._connection is not None:
+                    asyncio.ensure_future(self._connection.close())
                 break
 
     async def async_stop(self):
         """Close connection."""
         self._is_stopping = True
         if self._connection is not None:
-            await self._connection.close()
+            try:
+                await self._connection.close()
+            except Exception as err:
+                _LOGGER.debug("Error closing connection: %s", err)
         await self.proxy_services.unload()
 
     def _next_id(self):
@@ -517,7 +572,11 @@ class RemoteConnection:
 
     async def call(self, handler, message_type, **extra_args) -> None:
         if self._connection is None:
-            _LOGGER.error("No remote websocket connection")
+            _LOGGER.debug("No remote websocket connection available")
+            return
+
+        if self._connection.closed:
+            _LOGGER.debug("Remote websocket connection is closed")
             return
 
         _id = self._next_id()
@@ -526,8 +585,11 @@ class RemoteConnection:
             await self._connection.send_json(
                 {"id": _id, "type": message_type, **extra_args}
             )
-        except aiohttp.client_exceptions.ClientError as err:
-            _LOGGER.error("remote websocket connection closed: %s", err)
+        except (aiohttp.ClientError, ConnectionError, OSError) as err:
+            _LOGGER.info("Remote websocket connection error: %s", err)
+            await self._disconnected()
+        except Exception as err:
+            _LOGGER.warning("Unexpected error sending to remote connection: %s", err)
             await self._disconnected()
 
     async def _disconnected(self):
@@ -549,14 +611,18 @@ class RemoteConnection:
         self._entities = set()
         self._all_entity_names = set()
         if not self._is_stopping:
+            _LOGGER.info("Connection lost, attempting to reconnect...")
             asyncio.ensure_future(self.async_connect())
 
     async def _recv(self):
         while self._connection is not None and not self._connection.closed:
             try:
                 data = await self._connection.receive()
-            except aiohttp.client_exceptions.ClientError as err:
-                _LOGGER.error("remote websocket connection closed: %s", err)
+            except (aiohttp.ClientError, ConnectionError, OSError) as err:
+                _LOGGER.info("Remote websocket connection closed: %s", err)
+                break
+            except Exception as err:
+                _LOGGER.warning("Unexpected error receiving data: %s", err)
                 break
 
             if not data:
@@ -571,52 +637,55 @@ class RemoteConnection:
                 break
 
             if data.type == aiohttp.WSMsgType.ERROR:
-                _LOGGER.error("websocket connection had an error")
-                if data.data.code == aiohttp.WSCloseCode.MESSAGE_TOO_BIG:
+                _LOGGER.warning("websocket connection had an error")
+                if hasattr(data.data, 'code') and data.data.code == aiohttp.WSCloseCode.MESSAGE_TOO_BIG:
                     _LOGGER.error(f"please consider increasing message size with `{CONF_MAX_MSG_SIZE}`")
                 break
 
             try:
                 message = data.json()
-            except TypeError as err:
-                _LOGGER.error("could not decode data (%s) as json: %s", data, err)
-                break
+            except (TypeError, ValueError) as err:
+                _LOGGER.warning("could not decode data as json: %s", err)
+                continue
 
             if message is None:
                 break
 
             _LOGGER.debug("received: %s", message)
 
-            if message["type"] == api.TYPE_AUTH_OK:
-                self.set_connection_state(STATE_CONNECTED)
-                await self._init()
+            try:
+                if message["type"] == api.TYPE_AUTH_OK:
+                    self.set_connection_state(STATE_CONNECTED)
+                    await self._init()
 
-            elif message["type"] == api.TYPE_AUTH_REQUIRED:
-                if self._access_token:
-                    json_data = {"type": api.TYPE_AUTH, "access_token": self._access_token}
-                else:
-                    _LOGGER.error("Access token required, but not provided")
-                    self.set_connection_state(STATE_AUTH_REQUIRED)
-                    return
-                try:
-                    await self._connection.send_json(json_data)
-                except Exception as err:
-                    _LOGGER.error("could not send data to remote connection: %s", err)
-                    break
-
-            elif message["type"] == api.TYPE_AUTH_INVALID:
-                _LOGGER.error("Auth invalid, check your access token")
-                self.set_connection_state(STATE_AUTH_INVALID)
-                await self._connection.close()
-                return
-
-            else:
-                handler = self._handlers.get(message["id"])
-                if handler is not None:
-                    if inspect.iscoroutinefunction(handler):
-                        await handler(message)
+                elif message["type"] == api.TYPE_AUTH_REQUIRED:
+                    if self._access_token:
+                        json_data = {"type": api.TYPE_AUTH, "access_token": self._access_token}
                     else:
-                        handler(message)
+                        _LOGGER.error("Access token required, but not provided")
+                        self.set_connection_state(STATE_AUTH_REQUIRED)
+                        return
+                    try:
+                        await self._connection.send_json(json_data)
+                    except Exception as err:
+                        _LOGGER.warning("could not send auth data to remote connection: %s", err)
+                        break
+
+                elif message["type"] == api.TYPE_AUTH_INVALID:
+                    _LOGGER.error("Auth invalid, check your access token")
+                    self.set_connection_state(STATE_AUTH_INVALID)
+                    await self._connection.close()
+                    return
+
+                else:
+                    handler = self._handlers.get(message.get("id"))
+                    if handler is not None:
+                        if inspect.iscoroutinefunction(handler):
+                            await handler(message)
+                        else:
+                            handler(message)
+            except Exception as err:
+                _LOGGER.warning("Error processing message: %s", err)
 
         await self._disconnected()
 
@@ -669,13 +738,16 @@ class RemoteConnection:
 
             _LOGGER.debug("forward event: %s", data)
             
-            if self._connection is None:
-                _LOGGER.error("There is no remote connecion to send send data to")
+            if self._connection is None or self._connection.closed:
+                _LOGGER.debug("No active remote connection to forward event")
                 return
             try:
                 await self._connection.send_json(data)
+            except (aiohttp.ClientError, ConnectionError, OSError) as err:
+                _LOGGER.debug("could not send event to remote connection: %s", err)
+                await self._disconnected()
             except Exception as err:
-                _LOGGER.error("could not send data to remote connection: %s", err)
+                _LOGGER.warning("Unexpected error forwarding event: %s", err)
                 await self._disconnected()
 
         def state_changed(entity_id, state, attr):
